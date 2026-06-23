@@ -1,8 +1,12 @@
 import httpx
 from enum import Enum
+import logging
+import asyncio
+from playwright.sync_api import sync_playwright
 
 from app.core.config import settings
 
+logger = logging.getLogger(__name__)
 
 class AmazonService:
 
@@ -50,14 +54,121 @@ class AmazonService:
         cls,
         asin: str,
         country: str = "US",
+        skip_cache: bool = False
     ):
-        return await cls._get(
-            "/product-details",
-            {
-                "asin": asin,
-                "country": country,
-            },
-        )
+        from app.core.database import get_db
+        from datetime import datetime, timedelta
+        
+        db = get_db()
+        fallback_cache = None
+        
+        if not skip_cache:
+            cache_doc = await db.scraped_products.find_one({"asin": asin, "country": country})
+            if cache_doc and cache_doc.get("updated_at"):
+                # Cache for 30 days
+                if datetime.utcnow() - cache_doc["updated_at"] < timedelta(days=30):
+                    data = cache_doc["data"]
+                    if data.get("request_id") == "fallback-manual-scrape":
+                        fallback_cache = data
+                    else:
+                        return data
+        
+        # If cache miss or skip_cache, fetch from external API
+        try:
+            response = await cls._get(
+                "/product-details",
+                {
+                    "asin": asin,
+                    "country": country,
+                },
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (429, 403):
+                logger.warning(f"RapidAPI {e.response.status_code} error. Falling back to manual scrape for ASIN: {asin}")
+                
+                if fallback_cache:
+                    logger.info(f"Using existing fallback cache for ASIN: {asin}")
+                    return fallback_cache
+                
+                response = await cls._fallback_scrape_product(asin, country)
+            else:
+                raise e
+        
+        # Save to cache if successful
+        if response and response.get("status") == "OK":
+            await db.scraped_products.update_one(
+                {"asin": asin, "country": country},
+                {"$set": {
+                    "asin": asin,
+                    "country": country,
+                    "updated_at": datetime.utcnow(),
+                    "data": response
+                }},
+                upsert=True
+            )
+            
+        return response
+
+    @classmethod
+    def _sync_fallback_scrape_product(cls, asin: str, country: str):
+        domain = "amazon.com" if country.upper() == "US" else f"amazon.{country.lower()}"
+        if country.upper() == "UK":
+            domain = "amazon.co.uk"
+            
+        url = f"https://www.{domain}/dp/{asin}"
+        
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080}
+            )
+            page = context.new_page()
+            
+            try:
+                page.goto(url, timeout=30000)
+                # Wait for title to ensure page loaded
+                try:
+                    page.wait_for_selector("#productTitle", timeout=10000)
+                except Exception:
+                    logger.warning("Timeout waiting for #productTitle. Might be a captcha or different layout.")
+                
+                title = page.evaluate("() => { const el = document.querySelector('#productTitle'); return el ? el.innerText.trim() : null; }")
+                price = page.evaluate("() => { const el = document.querySelector('.a-price .a-offscreen'); return el ? el.innerText.trim() : null; }")
+                image = page.evaluate("() => { const el = document.querySelector('#landingImage'); return el ? el.getAttribute('src') : null; }")
+                
+                data = {
+                    "status": "OK",
+                    "request_id": "fallback-manual-scrape",
+                    "parameters": {
+                        "asin": asin,
+                        "country": country
+                    },
+                    "data": {
+                        "asin": asin,
+                        "product_title": title,
+                        "product_price": price,
+                        "product_photo": image,
+                        "product_url": url,
+                        "country": country,
+                        "currency": "$" if price and "$" in price else "UNKNOWN"
+                    }
+                }
+                return data
+            except Exception as e:
+                logger.error(f"Manual scrape failed for {asin}: {e}")
+                return {
+                    "status": "ERROR",
+                    "request_id": "fallback-manual-scrape",
+                    "message": f"Manual scrape failed: {str(e)}"
+                }
+            finally:
+                browser.close()
+
+    @classmethod
+    async def _fallback_scrape_product(cls, asin: str, country: str):
+        # Run the synchronous Playwright scraper in a separate thread to avoid asyncio loop conflicts in Uvicorn on Windows
+        return await asyncio.to_thread(cls._sync_fallback_scrape_product, asin, country)
 
     # ---------------------------------------------------
     # Product Offers

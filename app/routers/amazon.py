@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Body, Path, Query
+import asyncio
+from fastapi import APIRouter, Body, Path, Query, HTTPException
 from typing import Optional
 
-from app.schemas import ProductSearchRequest
+from app.schemas import ProductSearchRequest, FetchFromDocRequest
 from app.schemas.enums import (
     CountryEnum,
     BestSellerTypeEnum,
@@ -14,6 +15,8 @@ from app.schemas.enums import (
     StarRatingEnum,
 )
 from app.services.amazon_service import AmazonService
+from app.services.google_doc_service import GoogleDocService
+from app.core.database import db_instance
 
 router = APIRouter(
     prefix="/amazon",
@@ -35,6 +38,61 @@ async def search_products(
             "country": country
         }
     )
+
+@router.post("/fetch-products-from-doc")
+async def fetch_products_from_doc(
+    request: FetchFromDocRequest = Body(...)
+):
+    text = await GoogleDocService.extract_text_from_public_doc(request.doc_url)
+    if not text:
+        raise HTTPException(status_code=400, detail="Could not extract text from the provided Google Doc. Make sure it is public.")
+        
+    identifiers = GoogleDocService.parse_identifiers(text)
+    
+    total_items = len(identifiers)
+    start_idx = (request.page - 1) * request.limit
+    end_idx = start_idx + request.limit
+    
+    page_identifiers = identifiers[start_idx:end_idx]
+    
+    async def fetch_item(item):
+        if item["type"] == "asin":
+            try:
+                res = await AmazonService.product_details(item["value"], country=request.country.value)
+                return {"identifier": item["value"], "type": "asin", "data": res}
+            except Exception as e:
+                return {"identifier": item["value"], "type": "asin", "error": str(e)}
+        else:
+            try:
+                res = await AmazonService.scrape_by_url(item["value"], country=request.country.value)
+                return {"identifier": item["value"], "type": "url", "data": res}
+            except Exception as e:
+                return {"identifier": item["value"], "type": "url", "error": str(e)}
+
+    results = await asyncio.gather(*[fetch_item(item) for item in page_identifiers])
+    
+    if db_instance.db is not None:
+        for res in results:
+            if "error" not in res:
+                doc = {
+                    "identifier": res["identifier"],
+                    "type": res["type"],
+                    "data": res["data"],
+                    "status": "not_published"
+                }
+                await db_instance.db.products.update_one(
+                    {"identifier": res["identifier"]},
+                    {"$set": doc},
+                    upsert=True
+                )
+
+    return {
+        "page": request.page,
+        "limit": request.limit,
+        "total_items": total_items,
+        "total_pages": (total_items + request.limit - 1) // request.limit if request.limit > 0 else 0,
+        "products": results
+    }
 
 @router.get(
     "/product-details/{asin}",
